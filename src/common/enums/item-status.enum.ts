@@ -1,0 +1,25 @@
+export enum ItemStatus {
+  AVAILABLE = 'AVAILABLE',
+  RESERVED = 'RESERVED',
+  SOLD = 'SOLD',
+  DAMAGED = 'DAMAGED',
+}
+
+export enum OrderStatus {
+  PENDING = 'PENDING',
+  CONFIRMED = 'CONFIRMED',
+  FULFILLMENT_PENDING = 'FULFILLMENT_PENDING',
+  COMPLETED = 'COMPLETED',
+  CANCELLED = 'CANCELLED',
+}
+
+export enum FulfillmentType {
+  IN_STORE_PICKUP = 'IN_STORE_PICKUP',
+  SHIP_FROM_STORE = 'SHIP_FROM_STORE',
+}
+
+export enum OutboxStatus {
+  PENDING = 'PENDING',
+  PUBLISHED = 'PUBLISHED',
+  FAILED = 'FAILED',
+}

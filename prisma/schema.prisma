@@ -1,0 +1,143 @@
+// Prisma Schema for High-Concurrency Omnichannel Retail Store
+// Aiven PostgreSQL Configuration with strict serial tracking and row-level locking
+
+datasource db {
+  provider = "postgresql"
+  url      = env("AIVEN_PG_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum ItemStatus {
+  AVAILABLE
+  RESERVED
+  SOLD
+  DAMAGED
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  FULFILLMENT_PENDING
+  COMPLETED
+  CANCELLED
+}
+
+enum FulfillmentType {
+  IN_STORE_PICKUP
+  SHIP_FROM_STORE
+}
+
+model Store {
+  id          String       @id @default(uuid()) @db.Uuid
+  name        String       @db.VarChar(150)
+  code        String       @unique @db.VarChar(50)
+  address     String       @db.VarChar(255)
+  latitude    Decimal      @db.Decimal(10, 6)
+  longitude   Decimal      @db.Decimal(10, 6)
+  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime     @updatedAt @map("updated_at") @db.Timestamptz
+
+  inventory   UniqueItem[]
+  orders      Order[]
+
+  @@map("stores")
+}
+
+model Product {
+  id          String       @id @default(uuid()) @db.Uuid
+  sku         String       @unique @db.VarChar(100)
+  title       String       @db.VarChar(255)
+  description String?      @db.Text
+  category    String       @db.VarChar(100)
+  price       Decimal      @db.Decimal(12, 2)
+  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime     @updatedAt @map("updated_at") @db.Timestamptz
+
+  items       UniqueItem[]
+  orderItems  OrderItem[]
+
+  @@map("products")
+}
+
+model UniqueItem {
+  id                   String      @id @default(uuid()) @db.Uuid
+  productId            String      @map("product_id") @db.Uuid
+  storeId              String      @map("store_id") @db.Uuid
+  serialNumber         String      @unique @map("serial_number") @db.VarChar(120)
+  status               ItemStatus  @default(AVAILABLE)
+  
+  // Concurrency & Reservation TTL
+  reservedByUserId     String?     @map("reserved_by_user_id") @db.VarChar(100)
+  reservedAt           DateTime?   @map("reserved_at") @db.Timestamptz
+  reservationExpiresAt DateTime?   @map("reservation_expires_at") @db.Timestamptz
+  
+  orderId              String?     @map("order_id") @db.Uuid
+  soldAt               DateTime?   @map("sold_at") @db.Timestamptz
+  version              Int         @default(1)
+  
+  createdAt            DateTime    @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt            DateTime    @updatedAt @map("updated_at") @db.Timestamptz
+
+  product              Product     @relation(fields: [productId], references: [id], onDelete: Restrict)
+  store                Store       @relation(fields: [storeId], references: [id], onDelete: Restrict)
+  orderItem            OrderItem?
+
+  @@index([productId, storeId, status], name: "idx_unique_items_prod_store_status")
+  @@index([status, reservationExpiresAt], name: "idx_unique_items_status_expires")
+  @@map("unique_items")
+}
+
+model Order {
+  id               String          @id @default(uuid()) @db.Uuid
+  orderNumber      String          @unique @map("order_number") @db.VarChar(50)
+  userId           String          @map("user_id") @db.VarChar(100)
+  storeId          String          @map("store_id") @db.Uuid
+  status           OrderStatus     @default(CONFIRMED)
+  fulfillmentType  FulfillmentType @default(IN_STORE_PICKUP) @map("fulfillment_type")
+  totalAmount      Decimal         @map("total_amount") @db.Decimal(12, 2)
+  currency         String          @default("USD") @db.VarChar(10)
+  paymentReference String?         @map("payment_reference") @db.VarChar(150)
+  createdAt        DateTime        @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime        @updatedAt @map("updated_at") @db.Timestamptz
+
+  store            Store           @relation(fields: [storeId], references: [id], onDelete: Restrict)
+  items            OrderItem[]
+
+  @@index([userId], name: "idx_orders_user")
+  @@map("orders")
+}
+
+model OrderItem {
+  id           String     @id @default(uuid()) @db.Uuid
+  orderId      String     @map("order_id") @db.Uuid
+  productId    String     @map("product_id") @db.Uuid
+  uniqueItemId String     @unique @map("unique_item_id") @db.Uuid
+  serialNumber String     @map("serial_number") @db.VarChar(120)
+  price        Decimal    @db.Decimal(12, 2)
+  createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz
+
+  order        Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product      Product    @relation(fields: [productId], references: [id], onDelete: Restrict)
+  uniqueItem   UniqueItem @relation(fields: [uniqueItemId], references: [id], onDelete: Restrict)
+
+  @@map("order_items")
+}
+
+model OutboxEvent {
+  id           String     @id @default(uuid()) @db.Uuid
+  topic        String     @db.VarChar(150)
+  eventName    String     @map("event_name") @db.VarChar(100)
+  partitionKey String     @map("partition_key") @db.VarChar(150)
+  payload      Json       @db.JsonB
+  status       String     @default("PENDING") @db.VarChar(50)
+  retryCount   Int        @default(0) @map("retry_count")
+  errorMessage String?    @map("error_message") @db.Text
+  publishedAt  DateTime?  @map("published_at") @db.Timestamptz
+  createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([status, createdAt], name: "idx_outbox_status_created")
+  @@map("outbox_events")
+}

@@ -1,0 +1,734 @@
+openapi: 3.0.3
+info:
+  title: Omnichannel Mini-Warehouse Retail API
+  description: |
+    Production-grade High-Concurrency Retail Backend API.
+    Enforces the **Golden Invariant: Never sell the same physical item twice**.
+    Every physical store functions as an autonomous mini-warehouse tracking serialized individual physical items (`UniqueItem`).
+    
+    Integrated with:
+    - **Aiven PostgreSQL** (ACID Transactions & Row-Level Pessimistic Locking)
+    - **Aiven Kafka** (Event-driven inventory synchronization)
+    - **Aiven OpenSearch** (Fuzzy product discovery with real-time store availability and geo-distance queries)
+  version: 1.0.0
+  contact:
+    name: Principal Backend Architecture Team
+    email: backend-arch@retail-store.internal
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Local Development Server
+  - url: https://api.retail.production.internal/api/v1
+    description: Production Cluster (Aiven Managed)
+
+tags:
+  - name: Auth & Identity
+    description: User registration, authentication, and role management (Customers, Store Associates, Admins).
+  - name: Search
+    description: Smart fuzzy catalog search filtered by real-time physical store availability and customer geo-location.
+  - name: Cart & Reservation
+    description: Pessimistic inventory reservation with strict TTL preventing race conditions and double-selling.
+  - name: Checkout & Orders
+    description: Final order processing, payment verification, and serialized physical unit commitment.
+  - name: Stores & Inventory
+    description: Mini-warehouse store registry, serialized physical item audits, and in-store POS barcode scans.
+
+paths:
+  /auth/register:
+    post:
+      tags:
+        - Auth & Identity
+      summary: Register a new user account
+      operationId: registerUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: User registered successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthTokenResponse'
+        '409':
+          description: Email already in use.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /auth/login:
+    post:
+      tags:
+        - Auth & Identity
+      summary: Authenticate user credentials
+      operationId: loginUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login successful.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthTokenResponse'
+        '401':
+          description: Invalid email or password.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /auth/me:
+    get:
+      tags:
+        - Auth & Identity
+      summary: Retrieve current authenticated user profile
+      security:
+        - BearerAuth: []
+      operationId: getCurrentUserProfile
+      responses:
+        '200':
+          description: Current user profile details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfileResponse'
+        '401':
+          description: Unauthorized.
+
+  /search:
+    get:
+      tags:
+        - Search
+      summary: Smart Search with Real-Time Store Availability & Geo-Distance Filter
+      description: |
+        Executes a fuzzy full-text query against **Aiven OpenSearch**.
+        Guarantees that results **only** include products with at least one strictly `AVAILABLE` physical unit at the target store or within the specified customer geo-radius.
+      operationId: searchCatalog
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: Fuzzy search term (matches title, description, category, tags).
+          schema:
+            type: string
+            example: "waterproof trail running shoes"
+        - name: storeId
+          in: query
+          required: false
+          description: Specific physical store (mini-warehouse) ID.
+          schema:
+            type: string
+            format: uuid
+            example: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+        - name: lat
+          in: query
+          required: false
+          description: Customer latitude for geo-distance ranking and proximity filtering.
+          schema:
+            type: number
+            format: double
+            example: 40.7128
+        - name: lon
+          in: query
+          required: false
+          description: Customer longitude for geo-distance ranking and proximity filtering.
+          schema:
+            type: number
+            format: double
+            example: -74.0060
+        - name: radiusKm
+          in: query
+          required: false
+          description: Maximum radius in kilometers from customer coordinates (default 25km).
+          schema:
+            type: number
+            default: 25
+            example: 15
+        - name: category
+          in: query
+          required: false
+          description: Filter by product category.
+          schema:
+            type: string
+            example: "Footwear"
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Successfully retrieved available products matching query and store availability.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
+        '400':
+          description: Invalid query parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /cart/reserve:
+    post:
+      tags:
+        - Cart & Reservation
+      summary: Pessimistically Reserve an Individual Physical Item (Golden Rule Enforcer)
+      description: |
+        Pessimistically locks a specific physical `UniqueItem` in **Aiven PostgreSQL** using `SELECT ... FOR UPDATE NOWAIT` (or dynamic store allocation via `SKIP LOCKED`).
+        Transitions item status from `AVAILABLE` to `RESERVED` with a strict TTL (default 10 minutes).
+        Publishes `item.reserved` to Kafka topic `inventory.changes`.
+        
+        **Concurrency Guarantee:** If 50 concurrent shoppers attempt to reserve the exact same serialized unit, exactly 1 will succeed with HTTP 201; the remaining 49 will immediately receive HTTP 409 Conflict.
+      operationId: reserveUniqueItem
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReserveItemRequest'
+      responses:
+        '201':
+          description: Physical unit successfully locked and reserved for user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReservationSuccessResponse'
+        '409':
+          description: Item already reserved by another user or currently unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /cart/release:
+    post:
+      tags:
+        - Cart & Reservation
+      summary: Manually Release an Active Reservation
+      description: Releases an unpurchased `UniqueItem` back to `AVAILABLE` status before TTL expiration.
+      operationId: releaseItemReservation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseItemRequest'
+      responses:
+        '200':
+          description: Reservation released successfully. Item is available for other shoppers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReleaseSuccessResponse'
+
+  /checkout:
+    post:
+      tags:
+        - Checkout & Orders
+      summary: Complete Checkout and Commit Physical Unit to SOLD
+      description: Atomic transition committing reserved unit to SOLD, verifying payment, creating order, and emitting Kafka outbox events.
+      operationId: completeCheckout
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckoutRequest'
+      responses:
+        '201':
+          description: Checkout successful. Physical item permanently assigned to order.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckoutSuccessResponse'
+        '402':
+          description: Payment authorization failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Reservation expired or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /inventory/scan:
+    post:
+      tags:
+        - Stores & Inventory
+      summary: In-store Barcode / RFID POS Scanner (Omnichannel Sync)
+      description: Allows store clerks to mark shelf units as SOLD_IN_STORE, MARK_DAMAGED, or RESTOCK, updating online search immediately.
+      operationId: scanInventoryBarcode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScanItemRequest'
+      responses:
+        '200':
+          description: Physical status updated and synchronized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScanSuccessResponse'
+        '409':
+          description: Conflict: Item currently locked in an active online checkout cart.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    RegisterRequest:
+      type: object
+      required:
+        - email
+        - password
+        - fullName
+      properties:
+        email:
+          type: string
+          format: email
+          example: "jane.shopper@example.com"
+        password:
+          type: string
+          format: password
+          minLength: 8
+          example: "SuperSecure123!"
+        fullName:
+          type: string
+          example: "Jane Shopper"
+        role:
+          type: string
+          enum: [CUSTOMER, STORE_ASSOCIATE, STORE_MANAGER, ADMIN]
+          default: CUSTOMER
+        assignedStoreId:
+          type: string
+          format: uuid
+          nullable: true
+
+    LoginRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          example: "jane.shopper@example.com"
+        password:
+          type: string
+          format: password
+          example: "SuperSecure123!"
+
+    AuthTokenResponse:
+      type: object
+      required:
+        - accessToken
+        - tokenType
+        - expiresIn
+        - user
+      properties:
+        accessToken:
+          type: string
+        tokenType:
+          type: string
+          example: "Bearer"
+        expiresIn:
+          type: integer
+          example: 604800
+        user:
+          $ref: '#/components/schemas/UserProfileResponse'
+
+    UserProfileResponse:
+      type: object
+      required:
+        - id
+        - email
+        - fullName
+        - role
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        fullName:
+          type: string
+        role:
+          type: string
+          enum: [CUSTOMER, STORE_ASSOCIATE, STORE_MANAGER, ADMIN]
+        assignedStoreId:
+          type: string
+          format: uuid
+          nullable: true
+
+    SearchHit:
+      type: object
+      required:
+        - productId
+        - title
+        - price
+        - storeId
+        - storeName
+        - availableCount
+        - availableItems
+      properties:
+        productId:
+          type: string
+          format: uuid
+          example: "e6f8b122-6b94-4d62-95f1-39e2467d1d2b"
+        title:
+          type: string
+          example: "Ultralight Trail Runner Pro"
+        description:
+          type: string
+          example: "Durable Gore-Tex running shoe with carbon fiber plate."
+        category:
+          type: string
+          example: "Footwear"
+        price:
+          type: number
+          format: double
+          example: 189.99
+        storeId:
+          type: string
+          format: uuid
+          example: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+        storeName:
+          type: string
+          example: "Downtown Manhattan Flagship"
+        distanceKm:
+          type: number
+          format: double
+          nullable: true
+          example: 2.45
+        availableCount:
+          type: integer
+          example: 3
+        availableItems:
+          type: array
+          items:
+            $ref: '#/components/schemas/AvailableItemRef'
+
+    AvailableItemRef:
+      type: object
+      required:
+        - uniqueItemId
+        - serialNumber
+      properties:
+        uniqueItemId:
+          type: string
+          format: uuid
+          example: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        serialNumber:
+          type: string
+          example: "SN-NYC-104-00984"
+
+    SearchResponse:
+      type: object
+      required:
+        - total
+        - page
+        - limit
+        - hits
+      properties:
+        total:
+          type: integer
+          example: 14
+        page:
+          type: integer
+          example: 1
+        limit:
+          type: integer
+          example: 20
+        hits:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchHit'
+
+    ReserveItemRequest:
+      type: object
+      required:
+        - storeId
+        - userId
+      properties:
+        uniqueItemId:
+          type: string
+          format: uuid
+          example: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        productId:
+          type: string
+          format: uuid
+          example: "e6f8b122-6b94-4d62-95f1-39e2467d1d2b"
+        storeId:
+          type: string
+          format: uuid
+          example: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+        userId:
+          type: string
+          example: "usr_buyer_49102"
+        ttlSeconds:
+          type: integer
+          default: 600
+          example: 600
+
+    ReservationSuccessResponse:
+      type: object
+      required:
+        - reservationId
+        - uniqueItemId
+        - serialNumber
+        - productId
+        - storeId
+        - status
+        - reservedAt
+        - expiresAt
+      properties:
+        reservationId:
+          type: string
+          format: uuid
+          example: "a81d4fe6-03fa-4a24-9f4a-a459b1588661"
+        uniqueItemId:
+          type: string
+          format: uuid
+          example: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        serialNumber:
+          type: string
+          example: "SN-NYC-104-00984"
+        productId:
+          type: string
+          format: uuid
+          example: "e6f8b122-6b94-4d62-95f1-39e2467d1d2b"
+        storeId:
+          type: string
+          format: uuid
+          example: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+        status:
+          type: string
+          enum: [RESERVED]
+          example: "RESERVED"
+        reservedAt:
+          type: string
+          format: date-time
+          example: "2026-11-21T07:10:00Z"
+        expiresAt:
+          type: string
+          format: date-time
+          example: "2026-11-21T07:20:00Z"
+
+    ReleaseItemRequest:
+      type: object
+      required:
+        - reservationId
+        - uniqueItemId
+        - userId
+      properties:
+        reservationId:
+          type: string
+          format: uuid
+        uniqueItemId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+
+    ReleaseSuccessResponse:
+      type: object
+      required:
+        - success
+        - message
+        - uniqueItemId
+        - status
+      properties:
+        success:
+          type: boolean
+          example: true
+        message:
+          type: string
+          example: "Item successfully returned to AVAILABLE inventory."
+        uniqueItemId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          example: "AVAILABLE"
+
+    CheckoutRequest:
+      type: object
+      required:
+        - reservationId
+        - uniqueItemId
+        - userId
+        - paymentToken
+        - amount
+        - currency
+        - fulfillmentType
+      properties:
+        reservationId:
+          type: string
+          format: uuid
+          example: "a81d4fe6-03fa-4a24-9f4a-a459b1588661"
+        uniqueItemId:
+          type: string
+          format: uuid
+          example: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        userId:
+          type: string
+          example: "usr_buyer_49102"
+        paymentToken:
+          type: string
+          example: "tok_visa_4242_success"
+        amount:
+          type: number
+          format: double
+          example: 189.99
+        currency:
+          type: string
+          example: "USD"
+        fulfillmentType:
+          type: string
+          enum: [IN_STORE_PICKUP, SHIP_FROM_STORE]
+          example: "IN_STORE_PICKUP"
+
+    CheckoutSuccessResponse:
+      type: object
+      required:
+        - orderId
+        - orderNumber
+        - status
+        - uniqueItemId
+        - serialNumber
+        - storeId
+        - totalAmount
+        - currency
+        - createdAt
+      properties:
+        orderId:
+          type: string
+          format: uuid
+          example: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+        orderNumber:
+          type: string
+          example: "ORD-20261121-89104"
+        status:
+          type: string
+          enum: [CONFIRMED, FULFILLMENT_PENDING]
+          example: "CONFIRMED"
+        uniqueItemId:
+          type: string
+          format: uuid
+          example: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        serialNumber:
+          type: string
+          example: "SN-NYC-104-00984"
+        storeId:
+          type: string
+          format: uuid
+          example: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+        totalAmount:
+          type: number
+          format: double
+          example: 189.99
+        currency:
+          type: string
+          example: "USD"
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-11-21T07:12:45Z"
+
+    ScanItemRequest:
+      type: object
+      required:
+        - serialNumber
+        - action
+      properties:
+        serialNumber:
+          type: string
+          example: "SN-NYC-104-00984"
+        action:
+          type: string
+          enum: [SOLD_IN_STORE, MARK_DAMAGED, RESTOCK]
+          example: "SOLD_IN_STORE"
+        terminalId:
+          type: string
+          example: "POS_TERM_NYC_REGISTER_03"
+
+    ScanSuccessResponse:
+      type: object
+      required:
+        - success
+        - serialNumber
+        - newStatus
+        - action
+        - timestamp
+      properties:
+        success:
+          type: boolean
+          example: true
+        serialNumber:
+          type: string
+          example: "SN-NYC-104-00984"
+        newStatus:
+          type: string
+          example: "SOLD"
+        action:
+          type: string
+          example: "SOLD_IN_STORE"
+        timestamp:
+          type: string
+          format: date-time
+
+    ErrorResponse:
+      type: object
+      required:
+        - statusCode
+        - errorCode
+        - message
+        - timestamp
+      properties:
+        statusCode:
+          type: integer
+          example: 409
+        errorCode:
+          type: string
+          example: "ITEM_ALREADY_RESERVED"
+        message:
+          type: string
+          example: "Unique physical item '7c9e6679-7425-40de-944b-e07fc1f90ae7' is currently locked/reserved by another shopper."
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-11-21T07:10:05Z"
