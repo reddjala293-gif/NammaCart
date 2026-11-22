@@ -8,6 +8,7 @@
   "scripts": {
     "postinstall": "npx prisma generate",
     "build": "nest build",
+    "build:mem": "node --max-old-space-size=4096 ./node_modules/.bin/nest build",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
     "start:dev": "nest start --watch",
