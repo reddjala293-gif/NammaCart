@@ -102,10 +102,12 @@ describe('High-Concurrency Checkout Simulation (50 Concurrent Shoppers)', () => 
       recordEvent: jest.fn().mockResolvedValue({ id: 'outbox-uuid' }),
     };
 
+    const mockKafkaProducer = { emit: jest.fn().mockResolvedValue(undefined) };
     checkoutService = new CheckoutService(
       mockDataSource as any,
       mockInventoryRepo as any,
       mockOutboxService as any,
+      mockKafkaProducer as any,
     );
 
     const CONCURRENT_USERS = 50;
